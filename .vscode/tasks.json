@@ -1,0 +1,40 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "构建: 网盘服务器 (g++)",
+            "command": "C:/msys64/ucrt64/bin/g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "-std=c++17",
+                "-Wall",
+                "-pthread",
+                "-static",
+                "${fileDirname}/net.cpp",
+                "${fileDirname}/http.cpp",
+                "${fileDirname}/store.cpp",
+                "${fileDirname}/auth.cpp",
+                "${fileDirname}/main.cpp",
+                "-o",
+                "${fileDirname}/main.exe",
+                "-lws2_32"
+            ],
+            "options": {
+                "cwd": "${fileDirname}",
+                "env": {
+                    "PATH": "C:\\msys64\\ucrt64\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "MSYS2 UCRT64 g++ 编译四个单元 + 静态链接。必须 -static：本机 PATH 里同时存在 /mingw64/bin 和 /c/msys64/ucrt64/bin 两套 libstdc++-6.dll，前者基于 msvcrt、后者基于 ucrt，混用会导致 exe 启动即退出（退出码 127）。静态链接后 exe 无外部依赖，可脱离 MSYS2 直接运行。"
+        }
+    ]
+}

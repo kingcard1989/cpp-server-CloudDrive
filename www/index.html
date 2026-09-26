@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>简易网盘</title>
+<style>
+  :root {
+    --bg: #f2f6ff;
+    --panel: #ffffff;
+    --panel2: #fffcfc;
+    --line: #2a2f3a;
+    --text: #000000;
+    --dim: #000000;
+    --accent: #4c8dff;
+    --ok: #35c46b;
+    --warn: #f0a63a;
+    --err: #ef5350;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 20px 60px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px; margin-bottom: 18px;
+  }
+  .panel h2 {
+    font-size: 14px; margin: 0 0 14px; font-weight: 600;
+    color: var(--dim); text-transform: uppercase; letter-spacing: .06em;
+  }
+
+  /* 拖拽区 */
+  #drop {
+    border: 2px dashed var(--line); border-radius: 10px;
+    padding: 34px 20px; text-align: center; cursor: pointer;
+    transition: .15s; color: var(--dim);
+  }
+  #drop:hover, #drop.over { border-color: var(--accent);  color: var(--text); }
+  #drop b { color: var(--accent); }
+
+  .opts { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; }
+  .opts label { display: flex; align-items: center; gap: 7px; color: var(--dim); }
+  select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 9px; font-size: 13px;
+  }
+
+  /* 上传任务 */
+  .task { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .task:last-child { margin-bottom: 0; }
+  .task-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .task-name { font-weight: 600; word-break: break-all; }
+  .task-meta { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .bar { height: 6px; background: var(--panel2); border-radius: 3px; margin: 10px 0 8px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .18s; }
+  .bar.done > i { background: var(--ok); }
+  .bar.instant > i { background: var(--warn); }
+
+  /* 分片网格 */
+  .grid { display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 8px; }
+  .grid i {
+    width: 11px; height: 11px; border-radius: 2px;
+    background: var(--panel2); border: 1px solid var(--line);
+  }
+  .grid i.have { background: #2c3a55; border-color: #3a4d70; }
+  .grid i.done { background: var(--ok); border-color: var(--ok); }
+  .task-status { font-size: 12px; color: var(--dim); }
+  .task-status.ok { color: var(--ok); }
+  .task-status.err { color: var(--err); }
+  .task-status.warn { color: var(--warn); }
+
+  /* 文件表格 */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 8px; border-bottom: 1px solid #20242d; word-break: break-all; }
+  tr:last-child td { border-bottom: none; }
+  td.num { color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  a.dl { color: var(--accent); text-decoration: none; }
+  a.dl:hover { text-decoration: underline; }
+  button.del {
+    background: none; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 5px; padding: 3px 9px; cursor: pointer; font-size: 12px;
+  }
+  button.del:hover { border-color: var(--err); color: var(--err); }
+  .empty { color: var(--dim); padding: 10px 8px; }
+
+  /* 日志 */
+  #log {
+    background: #dde2ed; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; height: 180px; overflow-y: auto;
+    font: 12px/1.65 "Cascadia Mono", Consolas, monospace; color: var(--dim);
+  }
+  #log b { color: var(--accent); font-weight: 400; }
+  #log .ok { color: var(--ok); }
+  #log .err { color: var(--err); }
+  #log .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>简易网盘</h1>
+  <div class="sub">分片上传 · 断点续传 · 秒传 · Range 下载 —— 纯手工 HTTP 服务端，零依赖</div>
+
+  <div class="panel">
+    <h2>上传</h2>
+    <div id="drop">
+      拖文件到这里，或者 <b>点击选择</b>
+      <input type="file" id="file" multiple hidden>
+    </div>
+    <div class="opts">
+      <label>分片大小
+        <select id="chunkSize">
+          <option value="262144">256 KB</option>
+          <option value="1048576" selected>1 MB</option>
+          <option value="4194304">4 MB</option>
+          <option value="16777216">16 MB</option>
+        </select>
+      </label>
+      <label>并发数
+        <select id="concurrency">
+          <option value="1">1（串行，用来对比）</option>
+          <option value="2">2</option>
+          <option value="3" selected>3</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+        </select>
+      </label>
+      <label style="color:var(--dim)">
+        小文件建议 256KB，大文件建议 4MB
+      </label>
+    </div>
+    <div id="tasks" style="margin-top:16px"></div>
+  </div>
+
+  <div class="panel">
+    <h2>服务器上的文件</h2>
+    <div id="list"></div>
+  </div>
+
+  <div class="panel">
+    <h2>日志</h2>
+    <div id="log"></div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+// ==================================================================
+// 工具
+// ==================================================================
+
+const $ = id => document.getElementById(id);
+const MB = 1024 * 1024;
+
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < MB) return (n / 1024).toFixed(1) + " KB";
+  if (n < MB * 1024) return (n / MB).toFixed(2) + " MB";
+  return (n / MB / 1024).toFixed(2) + " GB";
+}
+
+function log(msg, cls) {
+  const box = $("log");
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.innerHTML = "<b>" + t + "</b>  " + msg;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+  while (box.childElementCount > 400) box.removeChild(box.firstChild);
+}
+
+// ==================================================================
+// 文件指纹（秒传的依据）
+// ==================================================================
+//
+// 说明：这里为了不引入任何第三方库，用一个"采样 + FNV 变体"的哈希。
+// 取文件开头 / 中间 / 末尾各 1MB 参与计算，再加上文件大小。
+//
+// ⚠️ 这不是密码学哈希，理论上不同内容可能撞出同一个指纹。
+//    真实产品会用流式 SHA-256（分块喂进去，内存占用恒定）。
+//    但演示"秒传"这个机制，这样足够了，而且算得飞快。
+
+async function fingerprint(file) {
+  const size = file.size;
+  let ranges;
+  if (size <= 3 * MB) {
+    ranges = [[0, size]];
+  } else {
+    ranges = [
+      [0, MB],
+      [Math.floor(size / 2) - MB / 2, MB],
+      [size - MB, MB],
+    ];
+  }
+
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b9 >>> 0;
+
+  for (const [start, len] of ranges) {
+    if (len <= 0) continue;
+    const u8 = new Uint8Array(await file.slice(start, start + len).arrayBuffer());
+    for (let i = 0; i < u8.length; i++) {
+      const b = u8[i];
+      h1 = Math.imul(h1 ^ b, 16777619) >>> 0;
+      h2 = Math.imul(h2 + b + 1, 2246822519) >>> 0;
+      h2 = ((h2 << 13) | (h2 >>> 19)) >>> 0;
+    }
+  }
+
+  const hex = n => n.toString(16).padStart(8, "0");
+  return hex(h1) + hex(h2) + "-" + size.toString(16);
+}
+
+// ==================================================================
+// 上传任务面板
+// ==================================================================
+
+function createTask(file) {
+  const el = document.createElement("div");
+  el.className = "task";
+  el.innerHTML =
+    '<div class="task-head">' +
+      '<span class="task-name"></span>' +
+      '<span class="task-meta">' + fmtSize(file.size) + '</span>' +
+    '</div>' +
+    '<div class="bar"><i></i></div>' +
+    '<div class="grid"></div>' +
+    '<div class="task-status">准备中…</div>';
+  el.querySelector(".task-name").textContent = file.name;
+  $("tasks").prepend(el);
+  return {
+    bar:   el.querySelector(".bar"),
+    fill:  el.querySelector(".bar > i"),
+    grid:  el.querySelector(".grid"),
+    status: el.querySelector(".task-status"),
+  };
+}
+
+// 分片网格：把每一片的到达情况画出来。
+// 片数太多就只留进度条，免得页面被上万个格子卡死。
+function buildGrid(ui, total) {
+  ui.grid.innerHTML = "";
+  if (total > 256) { ui.grid.style.display = "none"; return; }
+  ui.grid.style.display = "flex";
+  for (let i = 0; i < total; i++) ui.grid.appendChild(document.createElement("i"));
+}
+
+function markChunk(ui, index, cls) {
+  const cells = ui.grid.children;
+  if (index < cells.length) cells[index].className = cls;
+}
+
+// ==================================================================
+// 核心：分片上传
+// ==================================================================
+
+async function uploadFile(file) {
+  const ui = createTask(file);
+  const chunkSize = parseInt($("chunkSize").value, 10);
+  const concurrency = parseInt($("concurrency").value, 10);
+
+  try {
+    // ---- 1. 算指纹 ----
+    ui.status.textContent = "正在计算文件指纹…";
+    const hash = await fingerprint(file);
+    log("指纹 " + file.name + " → " + hash);
+
+    // ---- 2. 问服务器：这个文件你有吗？我有没有传过一半？ ----
+    const initUrl = "/api/upload/init" +
+      "?hash=" + encodeURIComponent(hash) +
+      "&name=" + encodeURIComponent(file.name) +
+      "&size=" + file.size +
+      "&chunkSize=" + chunkSize;
+
+    const initRes = await fetch(initUrl, { method: "POST" });
+    const init = await initRes.json();
+    if (!init.ok) throw new Error(init.error || "初始化失败");
+
+    const total = init.totalChunks;
+
+    // ---- 3. 秒传：服务器上已经有这个文件了 ----
+    if (init.status === "instant") {
+      buildGrid(ui, 0);
+      ui.bar.classList.add("instant");
+      ui.fill.style.width = "100%";
+      ui.status.className = "task-status warn";
+      ui.status.textContent = "⚡ 秒传成功 —— 服务器上已有相同文件，0 字节上传";
+      log("⚡ 秒传 " + file.name, "warn");
+      refreshList();
+      return;
+    }
+
+    buildGrid(ui, total);
+
+    // ---- 4. 断点续传：服务器告诉我们已经有哪些片了 ----
+    const done = new Set(init.received || []);
+    for (const i of done) markChunk(ui, i, "have");
+
+    if (done.size > 0) {
+      log("↻ 续传 " + file.name + " —— 已有 " + done.size + "/" + total + " 片", "warn");
+    } else {
+      log("↑ 开始上传 " + file.name + " —— " + total + " 片 × " +
+          fmtSize(chunkSize) + "，并发 " + concurrency);
+    }
+
+    // ---- 5. 建待传队列，只放服务器还缺的那些片 ----
+    const queue = [];
+    for (let i = 0; i < total; i++) if (!done.has(i)) queue.push(i);
+
+    let finished = done.size;
+    let cursor = 0;
+
+    function paint() {
+      ui.fill.style.width = (finished / total * 100).toFixed(1) + "%";
+      ui.status.textContent = "上传中 " + finished + "/" + total + " 片  ·  " +
+                              (finished / total * 100).toFixed(0) + "%";
+    }
+    paint();
+
+    // ---- 6. 并发池：开 N 个 worker，各自从队列里抢下一片 ----
+    //     这就是"并发优化"在客户端的对应物 —— 单个连接再快也吃不满带宽，
+    //     网络往返的延迟要靠并发来盖住。
+    async function worker() {
+      while (true) {
+        const my = cursor++;
+        if (my >= queue.length) return;
+
+        const index = queue[my];
+        const start = index * chunkSize;
+        const blob  = file.slice(start, Math.min(file.size, start + chunkSize));
+
+        const res = await fetch(
+          "/api/upload/chunk?uploadId=" + encodeURIComponent(init.uploadId) +
+          "&index=" + index,
+          { method: "POST", body: blob }
+        );
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "");
+          throw new Error("第 " + index + " 片上传失败 HTTP " + res.status + " " + txt);
+        }
+
+        markChunk(ui, index, "done");
+        finished++;
+        paint();
+      }
+    }
+
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, queue.length); i++) workers.push(worker());
+    await Promise.all(workers);
+
+    // ---- 7. 通知服务器：全部到齐，可以收尾了 ----
+    ui.status.textContent = "正在收尾…";
+    const finRes = await fetch("/api/upload/complete?uploadId=" +
+                               encodeURIComponent(init.uploadId), { method: "POST" });
+    const fin = await finRes.json();
+    if (!fin.ok) throw new Error(fin.error || "收尾失败");
+
+    ui.bar.classList.add("done");
+    ui.fill.style.width = "100%";
+    ui.status.className = "task-status ok";
+    ui.status.textContent = "✔ 上传完成（" + total + " 片）";
+    log("✔ 完成 " + file.name, "ok");
+    refreshList();
+
+  } catch (e) {
+    ui.status.className = "task-status err";
+    ui.status.textContent = "✘ " + e.message;
+    log("✘ " + file.name + "：" + e.message, "err");
+  }
+}
+
+// ==================================================================
+// 文件列表
+// ==================================================================
+
+async function refreshList() {
+  const box = $("list");
+  try {
+    const res = await fetch("/api/list");
+    const data = await res.json();
+    const files = data.files || [];
+
+    if (files.length === 0) {
+      box.innerHTML = '<div class="empty">还没有文件</div>';
+      return;
+    }
+
+    let html = "<table><tr><th>文件名</th><th>大小</th><th>指纹</th><th></th></tr>";
+    for (const f of files) {
+      html += "<tr>" +
+        "<td>" + escapeHtml(f.name) + "</td>" +
+        '<td class="num">' + fmtSize(f.size) + "</td>" +
+        '<td class="num">' + f.hash.slice(0, 12) + "…</td>" +
+        "<td>" +
+          '<a class="dl" href="/download/' + encodeURIComponent(f.hash) + '">下载</a>' +
+          '  <button class="del" data-hash="' + f.hash + '">删除</button>' +
+        "</td>" +
+      "</tr>";
+    }
+    html += "</table>";
+    box.innerHTML = html;
+
+    box.querySelectorAll("button.del").forEach(btn => {
+      btn.onclick = async () => {
+        const hash = btn.dataset.hash;
+        if (!confirm("确定删除？")) return;
+        const r = await fetch("/api/delete?hash=" + encodeURIComponent(hash), { method: "POST" });
+        const j = await r.json();
+        if (j.ok) { log("已删除 " + hash.slice(0, 12) + "…"); refreshList(); }
+        else log("删除失败：" + (j.error || r.status), "err");
+      };
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="empty">读取列表失败：' + escapeHtml(e.message) + "</div>";
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ==================================================================
+// 事件绑定
+// ==================================================================
+
+const drop = $("drop");
+
+drop.onclick = () => $("file").click();
+
+$("file").onchange = e => {
+  for (const f of e.target.files) uploadFile(f);
+  e.target.value = "";     // 清空，方便再选同一个文件
+};
+
+["dragenter", "dragover"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+
+["dragleave", "drop"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+
+drop.addEventListener("drop", e => {
+  for (const f of e.dataTransfer.files) uploadFile(f);
+});
+
+log("页面就绪。选个文件试试 —— 传完再传一次同一个文件，就能看到秒传。");
+refreshList();
+</script>
+</body>
+</html>
