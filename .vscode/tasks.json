@@ -16,14 +16,19 @@
                 "${fileDirname}/http.cpp",
                 "${fileDirname}/store.cpp",
                 "${fileDirname}/auth.cpp",
+                "${fileDirname}/user.cpp",
+                "${fileDirname}/filedb.cpp",
                 "${fileDirname}/db.cpp",
+
                 "${fileDirname}/main.cpp",
                 "-o",
                 "${fileDirname}/main.exe",
                 "-Wl,-Bdynamic",
                 "-lpq",
+                "-lcrypto",
                 "-lws2_32",
                 "-Wl,-Bstatic"
+
             ],
             "options": {
                 "cwd": "${fileDirname}",
