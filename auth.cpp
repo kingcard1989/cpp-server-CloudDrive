@@ -11,7 +11,7 @@ static std::string trim(const std::string&s){
    size_t e = s.find_last_not_of("\t\r\n");
    return s.substr(b,e-b+1);
 }
-static std::map<std::string, std::string> load_env(const std::string& path) {
+std::map<std::string, std::string> load_env(const std::string& path) {
     std::map<std::string, std::string> kv;
     std::ifstream in(path);
     if (!in) return kv;                      // 文件不存在，返回空表
