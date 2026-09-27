@@ -28,11 +28,22 @@ static std::string g_partDir;   // storage/part  —— 上传中的文件
 static std::mutex g_mtx;
 static std::map<std::string, std::shared_ptr<UploadSession>> g_sessions;
 
+// 会话的键。用 (ownerId, hash) 而不是只有 hash ——
+// 两个人同时上传同一个文件时 hash 完全相同，只按 hash 存会撞在一起。
+static std::string session_key(long long ownerId, const std::string& hash) {
+    return std::to_string(ownerId) + ":" + hash;
+}
+
 // ==================== 路径与小工具 ====================
 
 static std::string data_path(const std::string& hash) { return g_dataDir + "/" + hash + ".dat"; }
 static std::string meta_path(const std::string& hash) { return g_dataDir + "/" + hash + ".meta"; }
-static std::string part_path(const std::string& hash) { return g_partDir + "/" + hash + ".part"; }
+// 分片临时文件同样按 (ownerId, hash) 分开。
+// 两个人同时传同一个文件时 hash 相同，共用一个 .part 会互相踩：
+// 先完成的那位把 .part rename 走了，后一位的写入就打到空气上了。
+static std::string part_path(long long ownerId, const std::string& hash) {
+    return g_partDir + "/" + std::to_string(ownerId) + "_" + hash + ".part";
+}
 
 bool store_hash_ok(const std::string& h) {
     if (h.size() < 8 || h.size() > 64) return false;
@@ -53,7 +64,7 @@ bool store_hash_ok(const std::string& h) {
 // ★ 安全要点：绝对不要拿用户给的文件名去拼磁盘路径。
 //   本实现里磁盘上的文件名一律是 hash，原始名字只写在 .meta 里当数据用，
 //   所以就算这里漏了，也影响不到路径。这叫"纵深防御"。
-static std::string sanitize_name(const std::string& raw) {
+std::string store_clean_name(const std::string& raw) {
     std::string n;
     for (char c : raw) {
         if (c == '\r' || c == '\n') continue;
@@ -162,31 +173,6 @@ void FileReader::close() {
     fd = -1;
 }
 
-// ==================== 元数据 ====================
-
-static bool write_meta(const std::string& hash, const std::string& name, uint64_t size) {
-    std::ofstream out(meta_path(hash), std::ios::binary | std::ios::trunc);
-    if (!out) return false;
-    out << size << "\n" << name << "\n";
-    return out.good();
-}
-
-bool store_get(const std::string& hash, FileInfo& out) {
-    if (!store_hash_ok(hash)) return false;
-
-    std::ifstream in(meta_path(hash), std::ios::binary);
-    if (!in) return false;
-
-    std::string sizeLine, nameLine;
-    if (!std::getline(in, sizeLine)) return false;
-    std::getline(in, nameLine);
-
-    out.hash = hash;
-    out.size = std::strtoull(sizeLine.c_str(), nullptr, 10);
-    out.name = nameLine.empty() ? hash : nameLine;
-    return true;
-}
-
 // ==================== 对外接口 ====================
 
 void store_init(const std::string& root) {
@@ -211,40 +197,34 @@ std::string store_file_path(const std::string& hash) {
     return data_path(hash);
 }
 
-std::vector<FileInfo> store_list() {
-    std::vector<FileInfo> out;
-    std::error_code ec;
-
-    if (!fs::exists(g_dataDir, ec)) return out;
-
-    for (const auto& entry : fs::directory_iterator(g_dataDir, ec)) {
-        if (!entry.is_regular_file()) continue;
-        std::string p = entry.path().string();
-        if (p.size() < 5) continue;
-        if (p.compare(p.size() - 5, 5, ".meta") != 0) continue;
-
-        FileInfo fi;
-        if (store_get(entry.path().stem().string(), fi)) out.push_back(fi);
-    }
-
-    std::sort(out.begin(), out.end(),
-              [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
-    return out;
-}
-
 bool store_remove(const std::string& hash) {
     if (!store_hash_ok(hash)) return false;
 
     std::error_code ec;
     bool any = false;
     any |= fs::remove(data_path(hash), ec);
-    any |= fs::remove(meta_path(hash), ec);
+    any |= fs::remove(meta_path(hash), ec);   // 清掉第 5 步之前遗留的 .meta
 
-    {   // 顺手把可能残留的上传会话也清掉
+    {   // 残留的上传会话也一起清掉。
+        //   会话按 "ownerId:hash" 存，所以要把属于这个 hash 的全部扫出来。
         std::lock_guard<std::mutex> lk(g_mtx);
-        g_sessions.erase(hash);
+        for (auto it = g_sessions.begin(); it != g_sessions.end(); ) {
+            if (it->second->hash == hash) it = g_sessions.erase(it);
+            else ++it;
+        }
     }
-    fs::remove(part_path(hash), ec);
+
+    // 分片临时文件是 "<ownerId>_<hash>.part"，同样按后缀扫
+    std::string suffix = "_" + hash + ".part";
+    if (fs::exists(g_partDir, ec)) {
+        for (const auto& e : fs::directory_iterator(g_partDir, ec)) {
+            std::string n = e.path().filename().string();
+            if (n.size() > suffix.size() &&
+                n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                fs::remove(e.path(), ec);
+            }
+        }
+    }
 
     return any;
 }
@@ -253,15 +233,18 @@ std::shared_ptr<UploadSession> store_open_session(const std::string& hash,
                                                   const std::string& name,
                                                   uint64_t size,
                                                   uint64_t chunkSize,
+                                                  long long ownerId,
                                                   std::vector<int>& receivedOut) {
     receivedOut.clear();
     if (!store_hash_ok(hash)) return nullptr;
     if (chunkSize == 0) return nullptr;
 
+    const std::string key = session_key(ownerId, hash);
+
     std::lock_guard<std::mutex> lk(g_mtx);
 
     // 已有会话 → 直接复用，把进度原样报回去（这就是断点续传）
-    auto it = g_sessions.find(hash);
+    auto it = g_sessions.find(key);
     if (it != g_sessions.end()) {
         auto s = it->second;
         std::lock_guard<std::mutex> slk(s->mtx);
@@ -273,12 +256,13 @@ std::shared_ptr<UploadSession> store_open_session(const std::string& hash,
 
     auto s = std::make_shared<UploadSession>();
     s->hash        = hash;
-    s->name        = sanitize_name(name);
+    s->name        = store_clean_name(name);
     s->size        = size;
     s->chunkSize   = chunkSize;
     s->totalChunks = static_cast<int>(size == 0 ? 1 : (size + chunkSize - 1) / chunkSize);
+    s->ownerId     = ownerId;
     s->received.assign(static_cast<size_t>(s->totalChunks), 0);
-    s->partPath    = part_path(hash);
+    s->partPath    = part_path(ownerId, hash);
 
     // 预分配：文件一创建就是最终大小，后面的分片直接往对应偏移砸。
     // 这一步是"零拷贝合并"的前提。
@@ -290,13 +274,14 @@ std::shared_ptr<UploadSession> store_open_session(const std::string& hash,
         }
     }
 
-    g_sessions[hash] = s;
+    g_sessions[key] = s;
     return s;
 }
 
-std::shared_ptr<UploadSession> store_find_session(const std::string& hash) {
+std::shared_ptr<UploadSession> store_find_session(long long ownerId,
+                                                  const std::string& hash) {
     std::lock_guard<std::mutex> lk(g_mtx);
-    auto it = g_sessions.find(hash);
+    auto it = g_sessions.find(session_key(ownerId, hash));
     return (it == g_sessions.end()) ? nullptr : it->second;
 }
 
@@ -347,17 +332,26 @@ bool store_finish(const std::shared_ptr<UploadSession>& s) {
         }
     }
 
-    // ★ 这里就是"合并"——其实没有合并。
-    //   因为每一片从一开始就落在了最终位置上，收尾只是一次改名的原子操作。
-    //   如果是"先存 N 个临时文件再拼接"的老做法，这里要完整读写一遍磁盘。
     std::error_code ec;
-    fs::rename(s->partPath, data_path(s->hash), ec);
-    if (ec) {
-        log_line("[存储] rename 失败: " + ec.message());
-        return false;
+    if (fs::exists(data_path(s->hash), ec)) {
+        // 这个 hash 的文件已经在最终位置上了 —— 说明有别人（或更早的一次上传）
+        // 传过一模一样的内容。内容寻址下同一个 hash 就是同一份字节，
+        // 磁盘上那份就是我们要的，把自己的 .part 丢掉即可。
+        //
+        // ★ 这正是"一份 blob 对多个名字"的现场：
+        //   alice 叫它 report.pdf、bob 叫它 报告.pdf，磁盘上只有这一个 .dat。
+        //   所以名字绝不能存在磁盘上，只能存数据库 —— 一个字段装不下两个名字。
+        fs::remove(s->partPath, ec);
+    } else {
+        // ★ 这里就是"合并"——其实没有合并。
+        //   因为每一片从一开始就落在了最终位置上，收尾只是一次改名的原子操作。
+        //   如果是"先存 N 个临时文件再拼接"的老做法，这里要完整读写一遍磁盘。
+        fs::rename(s->partPath, data_path(s->hash), ec);
+        if (ec) {
+            log_line("[存储] rename 失败: " + ec.message());
+            return false;
+        }
     }
-
-    if (!write_meta(s->hash, s->name, s->size)) return false;
 
     {
         std::lock_guard<std::mutex> lk(g_mtx);
