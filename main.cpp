@@ -400,6 +400,21 @@ int main() {
     init_console_utf8();
     store_init("storage");
     auth_init(".env");
+    std::map<std::string, std::string> env = load_env(".env");
+
+auto it = env.find("PG_CONN");
+if (it == env.end()) {
+    log_line("[启动] .env 里没有 PG_CONN，数据库配置缺失");
+    return 1;
+}
+std::string pg_conn = it->second;
+  PGconn* g_db = db_connect(pg_conn);
+    if (!g_db) return 1;
+    
+    if (!db_init(g_db)) {
+        db_close(g_db);
+        return 1;
+    }
     log_line("[启动] 网盘服务器 v0.9 —— 分片上传 / 断点续传 / 秒传 / Range 下载");
 
     socket_t listener = create_listener(port);
