@@ -2,8 +2,8 @@
 #include <map>
 #include <fstream>
 #include "log.h"
-static std::string g_user;
-static std::string g_pass;
+#include <openssl/evp.h>
+
 
 static std::string trim(const std::string&s){
    size_t b = s.find_first_not_of("\t\r\n");
@@ -29,23 +29,6 @@ std::map<std::string, std::string> load_env(const std::string& path) {
         if (!key.empty()) kv[key] = val;
     }
     return kv;
-}
-bool auth_init(const std::string& config_path) {
-    auto cfg = load_env(config_path);
-
-    auto u = cfg.find("WP_USER");
-    auto p = cfg.find("WP_PASS");
-    if (u == cfg.end() || p == cfg.end() ||
-        u->second.empty() || p->second.empty()) {
-        log_line("[认证] " + config_path + " 里读不到 WP_USER / WP_PASS —— 所有请求一律拒绝");
-        return false;
-    }
-
-    g_user = u->second;
-    g_pass = p->second;
-    log_line("[认证] 已加载账号：" + g_user + "（密码长度 " +
-             std::to_string(g_pass.size()) + "）");
-    return true;
 }
 
 static int b64_val(unsigned char c) {
@@ -84,7 +67,7 @@ bool base64_decode(const std::string& in, std::string& out) {
     }
     return true;
 }
-static bool secure_equal(const std::string& a, const std::string& b) {
+bool secure_equal(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
     unsigned char diff = 0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -92,8 +75,32 @@ static bool secure_equal(const std::string& a, const std::string& b) {
     }
     return diff == 0;
 }
+std::string auth_hash_pwd(const std::string& pwd, const std::string& salt) {
+    constexpr int ITER = 100000;             // 迭代次数：越大越安全，也越慢
+    unsigned char out[32];                   // SHA-256 输出 32 字节
 
-bool auth_ok(const std::string& authorization) {
+    // 注意这个 API 的返回约定：成功返回 1，失败返回非 1（不是 0 表示成功）
+    int rc = PKCS5_PBKDF2_HMAC(
+        pwd.c_str(),  static_cast<int>(pwd.size()),
+        reinterpret_cast<const unsigned char*>(salt.c_str()),
+        static_cast<int>(salt.size()),
+        ITER, EVP_sha256(), static_cast<int>(sizeof(out)), out);
+
+    if (rc != 1) return std::string();       // 失败返回空串，调用方拒绝
+
+    // 转成十六进制。存文本而不是 BYTEA，是为了 psql 里能直接看懂。
+    static const char* HEX = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(64);
+    for (unsigned char c : out) {
+        hex.push_back(HEX[c >> 4]);          // 高 4 位
+        hex.push_back(HEX[c & 0x0F]);        // 低 4 位
+    }
+    return hex;
+}
+
+bool auth_parse_basic(const std::string& authorization,
+                      std::string& user, std::string& pwd) {
     const std::string prefix = "Basic ";
     if (authorization.size() <= prefix.size()) return false;
     if (authorization.compare(0, prefix.size(), prefix) != 0) return false;
@@ -101,17 +108,12 @@ bool auth_ok(const std::string& authorization) {
     std::string decoded;
     if (!base64_decode(authorization.substr(prefix.size()), decoded)) return false;
 
-    size_t colon = decoded.find(':');        // 格式固定是 "用户名:密码"
+    size_t colon = decoded.find(':');
     if (colon == std::string::npos) return false;
 
-    std::string user = decoded.substr(0, colon);
-    std::string pass = decoded.substr(colon + 1);
-
-    // 故意分开算再合并：如果写成 if (!okUser) return false，
-    // 用户名一错就跳过了密码比较，又给时序攻击留了缝。
-    bool okUser = secure_equal(user, g_user);
-    bool okPass = secure_equal(pass, g_pass);
-    return okUser && okPass;
+    user = decoded.substr(0, colon);
+    pwd  = decoded.substr(colon + 1);
+    return true;
 }
 
 std::string auth_challenge() {
