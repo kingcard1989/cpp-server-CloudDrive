@@ -16,10 +16,14 @@
                 "${fileDirname}/http.cpp",
                 "${fileDirname}/store.cpp",
                 "${fileDirname}/auth.cpp",
+                "${fileDirname}/db.cpp",
                 "${fileDirname}/main.cpp",
                 "-o",
                 "${fileDirname}/main.exe",
-                "-lws2_32"
+                "-Wl,-Bdynamic",
+                "-lpq",
+                "-lws2_32",
+                "-Wl,-Bstatic"
             ],
             "options": {
                 "cwd": "${fileDirname}",
@@ -34,7 +38,7 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "MSYS2 UCRT64 g++ 编译四个单元 + 静态链接。必须 -static：本机 PATH 里同时存在 /mingw64/bin 和 /c/msys64/ucrt64/bin 两套 libstdc++-6.dll，前者基于 msvcrt、后者基于 ucrt，混用会导致 exe 启动即退出（退出码 127）。静态链接后 exe 无外部依赖，可脱离 MSYS2 直接运行。"
+            "detail": "MSYS2 UCRT64 g++ 编译五个单元 + 混合链接。【为什么必须 -static】本机 PATH 里同时存在 /mingw64/bin 和 /c/msys64/ucrt64/bin 两套运行时（libstdc++-6.dll、libwinpthread-1.dll），前者基于 msvcrt、后者基于 ucrt，混用会导致 exe 启动即退出（退出码 127）。【为什么 libpq 不能静态】MSYS2 的 libpq.a 是残缺的（只有 19 个成员，没有 encnames），pg_encoding_to_char / pg_char_to_encoding 只在 libpq.dll 里，静态链接必然 undefined reference。【解法】-Wl,-Bdynamic 切到动态，只给 libpq 用；再用 -Wl,-Bstatic 切回来，让 GCC 自动加在末尾的 libstdc++ / libgcc / libwinpthread 保持静态。结果：exe 只依赖 libpq.dll（及其 libssl/libcrypto/libintl），其余全部静态，不会踩 127。"
         },
         {
             "type": "cppbuild",
