@@ -35,6 +35,32 @@
                 "isDefault": true
             },
             "detail": "MSYS2 UCRT64 g++ 编译四个单元 + 静态链接。必须 -static：本机 PATH 里同时存在 /mingw64/bin 和 /c/msys64/ucrt64/bin 两套 libstdc++-6.dll，前者基于 msvcrt、后者基于 ucrt，混用会导致 exe 启动即退出（退出码 127）。静态链接后 exe 无外部依赖，可脱离 MSYS2 直接运行。"
+        },
+        {
+            "type": "cppbuild",
+            "label": "构建: 当前文件 (g++)",
+            "command": "C:/msys64/ucrt64/bin/g++.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "-std=c++17",
+                "-Wall",
+                "-static",
+                "${file}",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}",
+                "env": {
+                    "PATH": "C:\\msys64\\ucrt64\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build",
+            "detail": "只编译当前打开的文件，输出同名 exe。供 launch.json 的 F5 调试使用（preLaunchTask 按 label 精确匹配，名字必须是「构建: 当前文件 (g++)」）。同样必须 -static，理由见上一个任务。"
         }
     ]
 }
