@@ -11,6 +11,9 @@
 #include <cstring>
 #include <algorithm>
 #include "db.h"
+#include "user.h"
+#include "filedb.h"
+
 constexpr int         port      = 9000;
 constexpr const char* WWW_ROOT  = "www";
 
@@ -23,6 +26,7 @@ constexpr size_t MAX_BODY = 16 * 1024 * 1024;
 constexpr size_t SEND_BLOCK = 256 * 1024;
 
 static std::atomic<int> g_seq{0};
+static PGconn* g_db = nullptr;   // 全局唯一的数据库连接
 
 // ==================== 小工具 ====================
 
@@ -89,9 +93,20 @@ static bool safe_static_path(const std::string& p) {
 
 // ==================== 下载（含 Range 支持）====================
 
-static void handle_download(socket_t conn, const HttpRequest& req, const std::string& hash) {
-    FileInfo fi;
-    if (!store_get(hash, fi)) {
+static void handle_download(socket_t conn, const HttpRequest& req,
+                            const std::string& hash, long long uid) {
+    // ★★ 越权访问（IDOR）就挡在这一行。
+    //
+    //   hash 是客户端算出来的，它不是秘密 —— 同一个文件谁算都是同一个 hash。
+    //   如果这里只按 hash 查、不带 uid，那么 bob 只要知道（或猜到、或从别处看到）
+    //   这个 hash，就能把 alice 的文件整个下载走。
+    //   这是 OWASP Top 10 里的"失效的访问控制"，也是网盘类产品最经典的漏洞。
+    //
+    //   注意查不到时返回 404 而不是 403：
+    //   403 等于承认"这文件确实存在，只是你没权限"，
+    //   攻击者拿它当探测器就能枚举出系统里有哪些文件。
+    FileRow fi;
+    if (!filedb_get(g_db, uid, hash, fi)) {
         send_text(conn, 404, "找不到这个文件\n");
         return;
     }
@@ -157,8 +172,16 @@ static std::string qs(const std::map<std::string, std::string>& q, const char* k
     return (it == q.end()) ? std::string() : it->second;
 }
 
-static void api_list(socket_t conn) {
-    auto files = store_list();
+static void api_list(socket_t conn, long long uid) {
+    // 只列自己的。以前 store_list() 是把整个磁盘目录扫一遍 ——
+    // 那会儿只有一个用户所以看不出问题，多人环境下那就是把所有人的
+    // 文件都摊给你看。这也是越权，只是比直接下载温和一点。
+    std::vector<FileRow> files;
+    if (!filedb_list(g_db, uid, files)) {
+        send_json(conn, "{\"ok\":false,\"error\":\"查询失败\"}", 500);
+        return;
+    }
+
     std::string j = "{\"ok\":true,\"files\":[";
     for (size_t i = 0; i < files.size(); ++i) {
         if (i) j += ",";
@@ -170,7 +193,8 @@ static void api_list(socket_t conn) {
     send_json(conn, j);
 }
 
-static void api_upload_init(socket_t conn, const std::map<std::string, std::string>& q) {
+static void api_upload_init(socket_t conn, const std::map<std::string, std::string>& q,
+                            long long uid) {
     std::string hash      = qs(q, "hash");
     std::string name      = qs(q, "name");
     uint64_t    size      = std::strtoull(qs(q, "size").c_str(), nullptr, 10);
@@ -185,13 +209,29 @@ static void api_upload_init(socket_t conn, const std::map<std::string, std::stri
     // 这个哈希的文件服务器上已经有了，一个字节都不用传。
     // 前提是客户端算哈希的方式和服务器对文件内容的认知一致。
     if (store_exists(hash)) {
+        // ★ 秒传也必须落库。
+        //   内容已经在磁盘上了，但"这份文件属于你"这件事还没记下来。
+        //   漏掉这一句会怎样：bob 秒传一个 alice 传过的文件，拿到 "instant"，
+        //   可他的文件列表里空空如也，点下载还是 404 —— 因为库里没有他的记录。
+        //
+        //   注意名字必须在这里洗一遍。秒传不建会话，名字不经过
+        //   store_open_session，不洗就直接进库、最后进响应头了。
+        int chunkCount = static_cast<int>(
+            size == 0 ? 1 : (size + chunkSize - 1) / chunkSize);
+
+        if (!filedb_add(g_db, uid, hash, store_clean_name(name), (long long)size,
+                        (int)chunkSize, chunkCount)) {
+            send_json(conn, "{\"ok\":false,\"error\":\"登记失败\"}", 500);
+            return;
+        }
+
         log_line("[秒传] " + name);
         send_json(conn, "{\"ok\":true,\"status\":\"instant\"}");
         return;
     }
 
     std::vector<int> received;
-    auto s = store_open_session(hash, name, size, chunkSize, received);
+    auto s = store_open_session(hash, name, size, chunkSize, uid, received);
     if (!s) {
         send_json(conn, "{\"ok\":false,\"error\":\"无法创建上传会话\"}", 500);
         return;
@@ -218,7 +258,7 @@ static void api_upload_init(socket_t conn, const std::map<std::string, std::stri
 }
 
 static void api_upload_chunk(socket_t conn, const std::map<std::string, std::string>& q,
-                             const std::string& body) {
+                             const std::string& body, long long uid) {
     std::string uploadId = qs(q, "uploadId");
     std::string idxStr   = qs(q, "index");
     if (uploadId.empty() || idxStr.empty()) {
@@ -227,7 +267,11 @@ static void api_upload_chunk(socket_t conn, const std::map<std::string, std::str
     }
 
     int  index = std::atoi(idxStr.c_str());
-    auto s     = store_find_session(uploadId);
+
+    // 带上 uid 找会话，只找"你自己的"那个。
+    // uploadId 就是文件 hash，并不保密 —— 不带 uid 的话，
+    // bob 可以往 alice 正在上传的会话里塞任意字节，把她的文件写坏。
+    auto s = store_find_session(uid, uploadId);
     if (!s) {
         send_json(conn, "{\"ok\":false,\"error\":\"上传会话不存在\"}", 404);
         return;
@@ -246,9 +290,10 @@ static void api_upload_chunk(socket_t conn, const std::map<std::string, std::str
     send_json(conn, "{\"ok\":true,\"index\":" + std::to_string(index) + "}");
 }
 
-static void api_upload_complete(socket_t conn, const std::map<std::string, std::string>& q) {
+static void api_upload_complete(socket_t conn, const std::map<std::string, std::string>& q,
+                                long long uid) {
     std::string uploadId = qs(q, "uploadId");
-    auto s = store_find_session(uploadId);
+    auto s = store_find_session(uid, uploadId);
     if (!s) {
         send_json(conn, "{\"ok\":false,\"error\":\"上传会话不存在\"}", 404);
         return;
@@ -257,22 +302,61 @@ static void api_upload_complete(socket_t conn, const std::map<std::string, std::
         send_json(conn, "{\"ok\":false,\"error\":\"还有分片没到齐\"}", 400);
         return;
     }
+
+    // 磁盘上的字节已经就位，现在补上"归属"这一笔。
+    if (!filedb_add(g_db, uid, s->hash, s->name, (long long)s->size,
+                    (int)s->chunkSize, s->totalChunks)) {
+        // 走到这里说明 blob 已经落在磁盘上、但库没写进去 —— 一个"孤儿 blob"。
+        // 这是跨系统操作没有事务保护的典型后果，第 6 步专门收拾它。
+        log_line("[上传] 元数据写入失败，磁盘上留下了孤儿: " + s->hash);
+        send_json(conn, "{\"ok\":false,\"error\":\"元数据写入失败\"}", 500);
+        return;
+    }
+
     send_json(conn, "{\"ok\":true}");
 }
 
-static void api_delete(socket_t conn, const std::map<std::string, std::string>& q) {
+static void api_delete(socket_t conn, const std::map<std::string, std::string>& q,
+                       long long uid) {
     std::string hash = qs(q, "hash");
-    if (hash.empty() || !store_remove(hash)) {
+    if (hash.empty()) {
         send_json(conn, "{\"ok\":false,\"error\":\"删除失败\"}", 404);
         return;
     }
-    log_line("[删除] " + hash);
+
+    // 先删"你自己的这条记录"。删不到 = 这文件不在你名下，和不存在一样回 404。
+    if (!filedb_remove(g_db, uid, hash)) {
+        send_json(conn, "{\"ok\":false,\"error\":\"删除失败\"}", 404);
+        return;
+    }
+
+    // ★ 接下来是关键：磁盘上那份 blob 可能还有别人在用。
+    //   内容寻址下，alice 和 bob 的同一个文件共用一份字节。
+    //   alice 一删就把 .dat 干掉的话，bob 的文件立刻就 404 了。
+    //   必须等引用计数归零才能动磁盘 —— 这就是引用计数。
+    long long refs = filedb_refcount(g_db, hash);
+    if (refs < 0) {
+        // 查不出来就别删。宁可留个垃圾文件，也不能删掉别人还要用的数据。
+        log_line("[删除] 引用计数查询失败，保守保留磁盘文件: " + hash);
+        send_json(conn, "{\"ok\":true}");
+        return;
+    }
+
+    if (refs == 0) {
+        store_remove(hash);
+        log_line("[删除] " + hash + "（最后一个引用，磁盘文件已删）");
+    } else {
+        log_line("[删除] " + hash + "（还有 " + std::to_string(refs) +
+                 " 条记录引用，磁盘保留）");
+    }
+
     send_json(conn, "{\"ok\":true}");
 }
 
 // ==================== 路由 ====================
 
-static void route(socket_t conn, int seq, const HttpRequest& req, const std::string& body) {
+static void route(socket_t conn, int seq, const HttpRequest& req,
+                  const std::string& body, long long uid) {
     const std::string& p = req.path;
     auto q = parse_query(req.query);
 
@@ -314,21 +398,21 @@ static void route(socket_t conn, int seq, const HttpRequest& req, const std::str
 
     // ---- 文件列表 ----
     if (p == "/api/list") {
-        api_list(conn);
+        api_list(conn, uid);
         return;
     }
 
     // ---- 上传三件套 ----
-    if (p == "/api/upload/init")     { api_upload_init(conn, q); return; }
-    if (p == "/api/upload/chunk")    { api_upload_chunk(conn, q, body); return; }
-    if (p == "/api/upload/complete") { api_upload_complete(conn, q); return; }
+    if (p == "/api/upload/init")     { api_upload_init(conn, q, uid); return; }
+    if (p == "/api/upload/chunk")    { api_upload_chunk(conn, q, body, uid); return; }
+    if (p == "/api/upload/complete") { api_upload_complete(conn, q, uid); return; }
 
     // ---- 删除 ----
-    if (p == "/api/delete") { api_delete(conn, q); return; }
+    if (p == "/api/delete") { api_delete(conn, q, uid); return; }
 
     // ---- 下载 ----
     if (p.rfind("/download/", 0) == 0) {
-        handle_download(conn, req, p.substr(10));
+        handle_download(conn, req, p.substr(10), uid);
         return;
     }
 
@@ -351,7 +435,11 @@ static void handle_client(socket_t conn, const std::string& ip, int seq) {
         return;
     }
     parse_headers(raw, req);
- if (!auth_ok(header_of(req, "authorization"))) {
+    // 认证：解析 Authorization 头 → 查库 → 比对密码哈希
+    std::string login_user, login_pwd;
+    long long   login_uid = 0;
+    if (!auth_parse_basic(header_of(req, "authorization"), login_user, login_pwd) ||
+        !user_check(g_db, login_user, login_pwd, login_uid)) {
         send_all(conn, build_response(401, status_text(401),
                                       "text/plain; charset=utf-8",
                                       "需要登录\n",
@@ -359,6 +447,7 @@ static void handle_client(socket_t conn, const std::string& ip, int seq) {
         CLOSE_SOCKET(conn);
         return;
     }
+
     // 有些客户端（curl、部分下载器）在发大 body 之前会先发一句
     // "Expect: 100-continue" 探路，等服务器回 "100 Continue" 才肯把 body 吐出来。
     // 不回它的话，客户端会干等约 1 秒然后硬发 —— 功能正常，但每个请求白等一秒。
@@ -388,7 +477,7 @@ static void handle_client(socket_t conn, const std::string& ip, int seq) {
     body.resize(need);
     req.body = body;
 
-    route(conn, seq, req, body);
+    route(conn, seq, req, body, login_uid);
 
     CLOSE_SOCKET(conn);
 }
@@ -399,7 +488,7 @@ int main() {
     if (!init_network()) return 1;
     init_console_utf8();
     store_init("storage");
-    auth_init(".env");
+    
     std::map<std::string, std::string> env = load_env(".env");
 
 auto it = env.find("PG_CONN");
@@ -408,10 +497,18 @@ if (it == env.end()) {
     return 1;
 }
 std::string pg_conn = it->second;
-  PGconn* g_db = db_connect(pg_conn);
-    if (!g_db) return 1;
-    
+  g_db = db_connect(pg_conn);
+if (!g_db) return 1;
+
+
     if (!db_init(g_db)) {
+        db_close(g_db);
+        return 1;
+    }
+
+    // 预置演示账号。幂等，每次启动跑一遍都安全。
+    if (!user_seed(g_db)) {
+        log_line("[启动] 预置账号失败");
         db_close(g_db);
         return 1;
     }
